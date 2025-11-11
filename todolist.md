@@ -14,7 +14,7 @@
 
 ## 3. AI/ML 服務整合
 - [x] 選擇並設定 AI 故事生成服務 (LLM API)。
-- [ ] 選擇並設定 AI 音檔生成服務 (TTS API)。
+- [x] 選擇並設定 AI 音檔生成服務 (TTS API)。
 - [ ] 選擇並設定 AI 影片生成服務 (圖像生成 + 影片編輯服務)。
 - [ ] 實作後端 API Routes/Server Actions，用於呼叫 AI 服務。
 
