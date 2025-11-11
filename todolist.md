@@ -1,52 +1,9 @@
-# 0-6歲小朋友英文故事繪本網站實作待辦事項
+# todolist
 
-## 1. 專案初始化與基礎設定
-- [ ] 建立 Next.js 專案。
-- [ ] 設定 ESLint, Prettier 等開發工具。
-- [ ] 設定 TypeScript。
-- [ ] 初始化 Git 儲存庫並進行首次提交。
-
-## 2. 資料庫設計與實作
-- [ ] 安裝 PostgreSQL。
-- [ ] 建立 `stories`, `story_pages`, `story_keywords` 資料表。
-- [ ] 實作資料庫連線與 ORM (例如 Prisma, Drizzle ORM)。
-- [ ] 撰寫資料庫遷移腳本。
-
-## 3. AI/ML 服務整合
-- [x] 選擇並設定 AI 故事生成服務 (LLM API)。
-- [x] 選擇並設定 AI 音檔生成服務 (TTS API)。
-- [ ] 選擇並設定 AI 影片生成服務 (圖像生成 + 影片編輯服務)。
-- [ ] 實作後端 API Routes/Server Actions，用於呼叫 AI 服務。
-
-## 4. 自動故事生成排程
-- [ ] 設定排程服務 (Cron Job 或 Serverless Scheduler)。
-- [x] 實作排程觸發的後端邏輯，包含：
-    - [x] 呼叫 AI 故事生成服務取得文本。
-    - [x] 儲存故事文本至資料庫。
-    - [x] 呼叫 AI 音檔生成服務取得音檔。
-    - [x] 上傳音檔至儲存服務 (AWS S3 / GCS)。
-    - [x] 呼叫 AI 影片生成服務取得影片。
-    - [x] 上傳影片至儲存服務 (AWS S3 / GCS)。
-    - [x] 更新故事狀態。
-- [x] 實作錯誤處理與通知機制。
-
-## 5. 前端介面開發
-- [ ] 設計並實作首頁 (類似 Netflix Banner 顯示近期5個故事)。
-- [ ] 實作故事列表頁面。
-- [ ] 實作故事詳情頁面 (包含每頁英文文本、中文翻譯、音檔播放、影片播放)。
-- [ ] 實作單字精選顯示功能。
-- [ ] 實作響應式設計。
-
-## 6. 部署與維護
-- [ ] 選擇雲端部署平台 (例如 Vercel, AWS Amplify, Google Cloud Run)。
-- [ ] 設定 CI/CD 流程。
-- [ ] 監控與日誌系統設定。
-- [ ] 備份策略。
-
-## 7. 測試
-- [ ] 撰寫單元測試。
-- [ ] 撰寫整合測試。
-- [ ] 進行端到端測試。
-
-## 8. 文件
-- [ ] 更新 `README.md` (包含專案描述、結構、技術棧、安裝與執行方式)。
+- [ ] 初始化資料庫 Schema 與 ORM 設定（stories, story_pages, media_assets, vocab_entries, generation_jobs 等）
+- [ ] 實作 OpenAI 文字生成流程（故事腳本、中文翻譯、精選單字）
+- [ ] 建立媒體生成管線（圖像、音訊、影片）並串接 Upstash Redis 佇列
+- [ ] 實裝 Vercel Cron 排程與任務觸發 API
+- [ ] 開發 Next.js App Router 前端閱讀介面與精選單字互動
+- [ ] 建立管理後台 Server Actions（故事審核、重跑任務、失敗重試）
+- [ ] 導入監控與通知（Sentry、排程失敗提醒）並完善部署流程
