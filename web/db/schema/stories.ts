@@ -1,10 +1,8 @@
 import { relations } from "drizzle-orm";
 import {
-  integer,
   jsonb,
   pgEnum,
   pgTable,
-  text,
   timestamp,
   uuid,
   varchar,
