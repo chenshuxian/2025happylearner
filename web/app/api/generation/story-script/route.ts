@@ -51,23 +51,68 @@ export async function POST(request: Request) {
       initiatedBy,
     };
  
-    // 使用 drizzle db insert 建立 generation job（status = pending）
-    // 在測試環境可能會被 mock，因此以 db.insert(...).values(...).returning() 寫法為主
-    const insertRes = await db.insert(generationJobs).values({
-      storyId: storyId,
-      jobType: "story_script",
-      status: "pending",
-      retryCount: 0,
-      // Drizzle 的 jsonb 欄位接受物件，直接傳 jobPayload (非字串化)
-      payload: jobPayload,
-    }).returning();
+    // 嘗試使用 Drizzle insert（開發/測試環境可能 mock 此行）
+    let createdJobIds: string[] = [];
+    try {
+      const insertRes = await db.insert(generationJobs).values({
+        storyId: storyId,
+        jobType: "story_script",
+        status: "pending",
+        retryCount: 0,
+        // Drizzle 的 jsonb 欄位接受物件，直接傳 jobPayload (非字串化)
+        payload: jobPayload,
+      }).returning();
+      createdJobIds = Array.isArray(insertRes)
+        ? insertRes.map((r) => String((r as { id: unknown }).id))
+        : [];
+      console.info("[route] created generation_jobs via drizzle", { storyId, createdJobIds, initiatedBy });
+    } catch (drizzleErr) {
+      // 若 Drizzle insert 因環境（fetch/WS）問題失敗，嘗試使用 pg pool fallback
+      console.warn("[route] drizzle insert failed, attempting pg fallback", { error: drizzleErr });
+      try {
+        // 建立或取用全域單例 pg Pool（動態 import 以避免在未安裝 pg 時造成錯誤）
+        const getPgPool = async () => {
+          const g = globalThis as any;
+          if (g.__pgPool && typeof g.__pgPool.connect === "function") return g.__pgPool;
+          const { Pool } = await import("pg");
+          const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+          g.__pgPool = pool;
+          return pool;
+        };
  
-    // insertRes 型態視 db client 而定，統一轉為 string id 陣列
-    const createdJobIds = Array.isArray(insertRes)
-      ? insertRes.map((r) => String((r as { id: unknown }).id))
-      : [];
- 
-    console.info("[route] created generation_jobs", { storyId, createdJobIds, initiatedBy });
+        const pool = await getPgPool();
+        const client = await pool.connect();
+        try {
+          await client.query("BEGIN");
+          const res = await client.query(
+            `INSERT INTO generation_jobs (story_id, job_type, status, retry_count, payload)
+             VALUES ($1,$2,$3,$4,$5) RETURNING id`,
+            [storyId, "story_script", "pending", 0, JSON.stringify(jobPayload)],
+          );
+          await client.query("COMMIT");
+          createdJobIds = res.rows ? res.rows.map((r: any) => String(r.id)) : [];
+          console.info("[route] created generation_jobs via pg fallback", { storyId, createdJobIds, initiatedBy });
+        } catch (pgErr) {
+          try {
+            await client.query("ROLLBACK");
+          } catch {
+            // ignore rollback error
+          }
+          console.error("[route] pg fallback insert failed", pgErr);
+          throw pgErr;
+        } finally {
+          try {
+            client.release();
+          } catch {
+            // ignore
+          }
+        }
+      } catch (fallbackErr) {
+        console.error("[route] both drizzle and pg fallback failed", { drizzleErr, fallbackErr });
+        // 回傳錯誤給呼叫端（勿回傳敏感資訊）
+        return NextResponse.json({ ok: false, error: "database insert failed" }, { status: 500 });
+      }
+    }
  
     return NextResponse.json({ ok: true, storyId, jobIds: createdJobIds }, { status: 200 });
   } catch (err: unknown) {

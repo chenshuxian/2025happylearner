@@ -206,14 +206,36 @@ sequenceDiagram
 - **流程說明**：從觸發端（Vercel Cron 或後台 Server Action）啟動，Orchestrator 依序生成腳本、翻譯、單字，並於每步透過 PromptToolkit 注入一致語境，最後由 ResultAssembler 驗證結構後寫回資料庫與佇列。
 - **監控節點**：Orchestrator 於每個階段記錄 OpenAI token 用量，Sentry 監聽 Prompt 或解析失敗；Upstash Redis 監控媒體任務佇列深度。
 - **延伸彈性**：若需增添校對或安全審核步驟，可在 Orchestrator 與 Queue 之間插入額外 generation_jobs 類型而不影響主流程。
-#### 8.1 文字生成專用 API 與 Server Action
-- **POST /api/generation/story-script**：接收 `story_id` 或主題，檢查是否存在草稿；若無則建立 `stories` 草稿與 `generation_jobs`（story_script、translation、vocabulary），推送 Redis Streams。
-- **POST /api/generation/retry**：管理端重試指定 `generation_job_id`，透過 Server Action 驗證權限後重新推入佇列並重置狀態。
-- **GET /api/generation/jobs/:storyId**：查詢故事相關所有文字任務狀態，供前端顯示進度與管理操作。
-- **Server Action triggerStoryPipeline**：由排程或後台呼叫；封裝故事主題、排程日期，批量建立 3 種 job 並觸發佇列。
-- **Server Action approveStory**：在完成翻譯與單字後，由管理者審核發布，更新 `stories.status` 為 `published` 並觸發後續媒體生成。
-- **授權策略**：Route Handler 依據 Auth.js session 驗證角色；Server Action 使用 `cache: no-store` 避免快取敏感操作；所有動作寫入 `audit_logs`。
-- **Token 控管**：預估每階段 Token 並紀錄，若超出閾值改用 `prompt_truncation` 策略（例如減少故事細節或縮短例句）。
+#### 8.1 文字生成專用 API 與 Server Action（非同步優先設計）
+- 設計原則：為避免在 HTTP 請求中同步執行大量模型呼叫（長時間阻塞、超時與高額成本），建議以「立即建立 generation_jobs 並回傳 job id」的非同步流程為主，將實際的文字生成工作交由 worker（非同步消費者）處理。
+- API 與行為：
+  - **POST /api/generation/trigger**（管理端 / Cron 呼叫）
+    - 功能：接收故事主題 / storyId / 排程資訊，建立一或多個 `generation_jobs`（job_type 範例：`story_script`）；回傳新建立的 job id 列表與基本排程記錄。
+    - 回傳範例：{ ok: true, jobIds: ["<uuid>","..."], storyId: "<id>" }
+    - 實作參考：請參考路由實作樣板 [`web/app/api/generation/story-script/route.ts`](web/app/api/generation/story-script/route.ts:1)（需改為建立 job 而非同步執行生成）。
+  - **POST /api/generation/retry**：管理端重試指定 `generation_job_id`，Server Action 驗證權限後重新推入佇列並重置狀態（保留現有行為）。
+  - **GET /api/generation/jobs/:storyId**：查詢故事相關所有文字任務狀態，供前端顯示進度與管理操作（保留）。
+  - **Server Action triggerStoryPipeline**：由排程或後台呼叫；改為建立 `generation_jobs`（story_script、translation、vocabulary 或單一步驟 job），並回傳 job ids。
+  - **Server Action approveStory**：在完成翻譯與單字後，由管理者審核發布，更新 `stories.status` 為 `published` 並觸發後續媒體 generation_jobs。
+- Job payload contract（generation_jobs.payload 範例，JSONB）
+  - story_script job:
+    - { "type":"story_script", "storyId":"<id>", "theme":"<theme>", "tone":"warm", "ageRange":"0-6", "scheduledAt":"<iso>" }
+  - translation job:
+    - { "type":"translation", "storyId":"<id>", "source":"story_script", "pagesContext": <summary|partial> }
+  - vocabulary job:
+    - { "type":"vocabulary", "storyId":"<id>", "source":"translation" }
+- Worker / 消費者契約（worker responsibilities）
+  - Worker 從 Upstash list/stream 取得 jobId → 讀取 `generation_jobs` 與對應 payload → 執行相對應 Orchestrator 階段或完整 pipeline → 使用 transaction 寫回 `stories` / `story_pages` / `vocab_entries` / `generation_jobs` 狀態 → 若需要推送更多 jobs（image/audio），由 persistence 層呼叫 `pushJobsToUpstash`。
+  - 建議在 worker 中注入可測試的 `StoryGenerationOrchestrator` 與 `OrchestrationPersistence`（參考：[`web/lib/openai/StoryGenerationOrchestrator.ts`](web/lib/openai/StoryGenerationOrchestrator.ts:1) 與 [`web/lib/openai/OrchestrationPersistence.ts`](web/lib/openai/OrchestrationPersistence.ts:1)）。
+- 授權與稽核：
+  - Route Handler 與 Server Actions 仍依 Auth.js session 驗證角色。
+  - 所有重要狀態變更寫入 `audit_logs`，並在 job 建立時記錄 initiator 與來源（cron/manager/ui）。
+- Token 控管：
+  - 預估每階段 Token 並紀錄於 job context；若超出預算，route/server action 回傳 `ok:false` 並將 job 設為 `blocked_for_cost`（管理者可審核後解鎖或降級模型）。
+- 遷移建議（短期）
+  - 先將現有同步 route 改為「建立 job 並回傳」的行為（低風險，容易回滾）。
+  - 新增一個簡單 worker 範例（放入 [`web/worker/` 目錄]），先實作文字生成 consumer，再逐步加入媒體生成 consumer。
+  - 測試策略：單元測試保留 Orchestrator / Persistence 的 mock tests；整合測試在 staging 使用真實 Upstash 設定與受限 OpenAI key 以驗證 E2E 成功率。
 - Cron 觸發後建立 `generation_jobs`，狀態 `pending`。
 - Worker 消費時轉為 `processing`，若成功更新為 `completed`。
 ### 10.1 文字生成錯誤處理與監控
