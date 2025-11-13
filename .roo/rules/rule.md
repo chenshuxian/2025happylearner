@@ -1,0 +1,30 @@
+# AI Rules for {{project-name}}
+
+{{project-description}}
+
+## FRONTEND
+
+### Guidelines for REACT
+
+#### NEXT_JS
+
+- Use App Router and Server Components for improved performance and SEO
+- Implement route handlers for API endpoints instead of the pages/api directory
+- Use server actions for form handling and data mutations from Server Components
+- Leverage Next.js Image component with proper sizing for core web vitals optimization
+- Implement the Metadata API for dynamic SEO optimization
+- Use React Server Components for {{data_fetching_operations}} to reduce client-side JavaScript
+- Implement Streaming and Suspense for improved loading states
+- Use the new Link component without requiring a child <a> tag
+- Leverage parallel routes for complex layouts and parallel data fetching
+- Implement intercepting routes for modal patterns and nested UIs
+
+## DATABASE
+
+### Guidelines for SQL
+
+#### POSTGRES
+
+- Use connection pooling to manage database connections efficiently
+- Implement JSONB columns for semi-structured data instead of creating many tables for {{flexible_data}}
+- Use materialized views for complex, frequently accessed read-only data

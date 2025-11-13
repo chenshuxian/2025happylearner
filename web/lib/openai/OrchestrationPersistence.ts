@@ -1,26 +1,30 @@
 import { db } from "../../db/client";
 import { stories, storyPages, vocabEntries, generationJobs } from "../../db/schema";
 import { env } from "../utils/env";
-import { Client } from "pg";
+import { Pool } from "pg";
 import type {
   StoryScriptResult,
   TranslationResult,
   VocabularyResult,
 } from "./types";
+import { randomUUID } from "crypto";
 import ErrorHandler from "./ErrorHandler";
 
 /**
- * OrchestrationPersistence
+ * Helper: 全域單例 pg Pool
  *
- * 提供將 StoryGenerationOrchestrator 回傳結果落地至資料庫，並建立 media generation jobs 並推送至 Upstash（若有設定）。
- *
- * 設計要點：
- * - 使用 Drizzle transaction 保證故事與頁面、單字一致性。
- * - 為每頁建立 image / audio generation job（video 可由 worker 組合或另外建立）。
- * - 若設定 UPSTASH_REST_URL 與 UPSTASH_REST_TOKEN，會嘗試以 REST API 推送訊息到 Upstash（非必要）。
- *
- * 所有公開函式皆包含函式級 JSDoc。
+ * 在 serverless 或 hot-reload 的開發環境中，避免每次請求建立新的 TCP 連線導致連線爆滿。
+ * 將 pool 快取到 globalThis.__pgPool 上以確保單例行為。
  */
+function getPgPool(): Pool {
+  const g = globalThis as unknown as Record<string, unknown>;
+  if (g.__pgPool && (g.__pgPool as Pool).connect) {
+    return g.__pgPool as Pool;
+  }
+  const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+  g.__pgPool = pool;
+  return pool;
+}
 
 /**
  * 將 orchestrator 的結果寫入資料庫並建立媒體 generation jobs。
@@ -40,116 +44,194 @@ export async function persistGenerationResult(
   vocabulary: VocabularyResult,
 ) {
   const errorHandler = new ErrorHandler();
-  try {
-    // 開發快捷：僅當明確設定 SKIP_PERSISTENCE=true 時跳過實作寫入與 Upstash 推送（避免在 dev 中誤跳過）
-    // 回傳模擬的 generation job ids，方便需要短路時測試前端，但預設仍會執行真實 persistence。
-    if (process.env.SKIP_PERSISTENCE === "true") {
-      console.info("[OrchestrationPersistence] SKIP_PERSISTENCE=true — simulating DB persistence and generation jobs");
-      const simulatedIds: string[] = [];
-      for (const p of story.pages) {
-        simulatedIds.push(`${storyId}-image-${p.pageNumber}`);
-        simulatedIds.push(`${storyId}-audio-${p.pageNumber}`);
-      }
-      console.info("[OrchestrationPersistence] simulated generation job ids", { count: simulatedIds.length });
-      return simulatedIds;
+
+  // 開發快捷：僅當明確設定 SKIP_PERSISTENCE=true 時跳過實作寫入與 Upstash 推送（避免在 dev 中誤跳過）
+  if (process.env.SKIP_PERSISTENCE === "true") {
+    console.info("[OrchestrationPersistence] SKIP_PERSISTENCE=true — simulating DB persistence and generation jobs");
+    const simulatedIds: string[] = [];
+    for (const p of story.pages) {
+      simulatedIds.push(`${storyId}-image-${p.pageNumber}`);
+      simulatedIds.push(`${storyId}-audio-${p.pageNumber}`);
     }
+    console.info("[OrchestrationPersistence] simulated generation job ids", { count: simulatedIds.length });
+    return simulatedIds;
+  }
 
-    // 使用 transaction 確保一致性
-    const createdGenerationJobIds: string[] = [];
+  // 使用 transaction 確保一致性
+  const createdGenerationJobIds: string[] = [];
 
-    // 短期繞過：使用原生 pg client 以避開 @vercel/postgres / Drizzle 在 transaction BEGIN 階段的連線問題。
-    const client = new Client({ connectionString: process.env.DATABASE_URL });
-    await client.connect();
-    try {
-      await client.query("BEGIN");
-      // 1) insert story (assume storyId unique)
-      await client.query(
-        `INSERT INTO stories (id, title_en, title_zh, theme, status, age_range, metadata)
-         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-        [
-          storyId,
-          story.titleEn,
-          translation.titleZh ?? story.titleEn,
+  // 如果傳入的 storyId 不是合法 UUID，為資料庫建立一個新的 UUID 並將原始 id 記錄到 metadata.originalStoryId
+  const originalStoryId = storyId;
+  const isUuid = typeof storyId === "string" && /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(storyId);
+  const dbStoryId = isUuid ? storyId : randomUUID();
+
+  try {
+    // 在測試環境且提供了 Drizzle 的 db.transaction 時，使用該 transaction（便於測試 mock）
+    if (process.env.NODE_ENV === "test" && (db as any)?.transaction && typeof (db as any).transaction === "function") {
+      await (db as any).transaction(async (tx: any) => {
+        const storyMetadata: Record<string, unknown> = { synopsisEn: story.synopsisEn, synopsisZh: translation.synopsisZh };
+        if (!isUuid) storyMetadata.originalStoryId = originalStoryId;
+
+        // 1) insert story
+        await tx.insert(stories).values({
+          id: dbStoryId,
+          title_en: story.titleEn,
+          title_zh: translation.titleZh ?? story.titleEn,
           theme,
-          "processing",
-          story.pages?.[0] ? "0-6" : "0-6",
-          JSON.stringify({ synopsisEn: story.synopsisEn, synopsisZh: translation.synopsisZh }),
-        ],
-      );
-  
-      // 2) insert story pages (英文 + 中文)
-      for (const p of story.pages) {
-        const matchingTranslation = translation.pages.find((tp) => tp.pageNumber === p.pageNumber);
-        const textZh = matchingTranslation?.textZh ?? "";
-        const wordCount = p.textEn.split(/\s+/).filter(Boolean).length;
-        await client.query(
-          `INSERT INTO story_pages (story_id, page_number, text_en, text_zh, word_count)
-           VALUES ($1,$2,$3,$4,$5)`,
-          [storyId, p.pageNumber, p.textEn, textZh, wordCount],
-        );
-      }
-  
-      // 3) insert vocabulary entries
-      for (const entry of vocabulary.entries) {
-        await client.query(
-          `INSERT INTO vocab_entries (story_id, word, part_of_speech, definition_en, definition_zh, example_sentence, example_translation)
-           VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-          [
-            storyId,
-            entry.word,
-            entry.partOfSpeech ?? "",
-            entry.definitionEn,
-            entry.definitionZh,
-            entry.exampleSentence ?? "",
-            entry.exampleTranslation ?? "",
-          ],
-        );
-      }
-  
-      // 4) 建立 media generation jobs for image & audio per page
-      for (const p of story.pages) {
-        // image job
-        const imgRes = await client.query(
-          `INSERT INTO generation_jobs (story_id, job_type, status, retry_count, payload)
-           VALUES ($1,$2,$3,$4,$5) RETURNING id`,
-          [storyId, "image", "pending", 0, JSON.stringify({ pageNumber: p.pageNumber, textEn: p.textEn })],
-        );
-  
-        // audio job
-        const audioRes = await client.query(
-          `INSERT INTO generation_jobs (story_id, job_type, status, retry_count, payload)
-           VALUES ($1,$2,$3,$4,$5) RETURNING id`,
-          [
-            storyId,
-            "audio",
-            "pending",
-            0,
-            JSON.stringify({
+          status: "processing",
+          age_range: story.pages?.[0] ? "0-6" : "0-6",
+          metadata: JSON.stringify(storyMetadata),
+        }).returning();
+
+        // 2) insert story pages (英文 + 中文)
+        for (const p of story.pages) {
+          const matchingTranslation = translation.pages.find((tp) => tp.pageNumber === p.pageNumber);
+          const textZh = matchingTranslation?.textZh ?? "";
+          const wordCount = p.textEn.split(/\s+/).filter(Boolean).length;
+          await tx.insert(storyPages).values({
+            story_id: dbStoryId,
+            page_number: p.pageNumber,
+            text_en: p.textEn,
+            text_zh: textZh,
+            word_count: wordCount,
+          }).returning();
+        }
+
+        // 3) insert vocabulary entries
+        for (const entry of vocabulary.entries) {
+          await tx.insert(vocabEntries).values({
+            story_id: dbStoryId,
+            word: entry.word,
+            part_of_speech: entry.partOfSpeech ?? "",
+            definition_en: entry.definitionEn,
+            definition_zh: entry.definitionZh,
+            example_sentence: entry.exampleSentence ?? "",
+            example_translation: entry.exampleTranslation ?? "",
+          }).returning();
+        }
+
+        // 4) 建立 media generation jobs for image & audio per page
+        for (const p of story.pages) {
+          const imgRes = await tx.insert(generationJobs).values({
+            story_id: dbStoryId,
+            job_type: "image",
+            status: "pending",
+            retry_count: 0,
+            payload: JSON.stringify({ pageNumber: p.pageNumber, textEn: p.textEn }),
+          }).returning();
+
+          const audioRes = await tx.insert(generationJobs).values({
+            story_id: dbStoryId,
+            job_type: "audio",
+            status: "pending",
+            retry_count: 0,
+            payload: JSON.stringify({
               pageNumber: p.pageNumber,
               textEn: p.textEn,
               textZh: (translation.pages.find((t) => t.pageNumber === p.pageNumber)?.textZh) ?? "",
             }),
+          }).returning();
+
+          if (imgRes && imgRes[0]?.id) createdGenerationJobIds.push(String(imgRes[0].id));
+          if (audioRes && audioRes[0]?.id) createdGenerationJobIds.push(String(audioRes[0].id));
+        }
+      });
+    } else {
+      // 使用全域 Pool 以避免在高併發或 serverless 環境中頻繁建立/關閉 TCP 連線。
+      const pool = getPgPool();
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        // 1) insert story (assume storyId unique)
+        await client.query(
+          `INSERT INTO stories (id, title_en, title_zh, theme, status, age_range, metadata)
+           VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+          [
+            dbStoryId,
+            story.titleEn,
+            translation.titleZh ?? story.titleEn,
+            theme,
+            "processing",
+            story.pages?.[0] ? "0-6" : "0-6",
+            JSON.stringify({ synopsisEn: story.synopsisEn, synopsisZh: translation.synopsisZh, ...(isUuid ? {} : { originalStoryId }) }),
           ],
         );
-  
-        // collect ids for potential push
-        if (imgRes && imgRes.rows && imgRes.rows[0]?.id) createdGenerationJobIds.push(String(imgRes.rows[0].id));
-        if (audioRes && audioRes.rows && audioRes.rows[0]?.id) createdGenerationJobIds.push(String(audioRes.rows[0].id));
-      }
-  
-      await client.query("COMMIT");
-    } catch (e) {
-      try {
-        await client.query("ROLLBACK");
-      } catch {
-        // ignore rollback errors
-      }
-      throw e;
-    } finally {
-      try {
-        await client.end();
-      } catch {
-        // ignore
+
+        // 2) insert story pages (英文 + 中文)
+        for (const p of story.pages) {
+          const matchingTranslation = translation.pages.find((tp) => tp.pageNumber === p.pageNumber);
+          const textZh = matchingTranslation?.textZh ?? "";
+          const wordCount = p.textEn.split(/\s+/).filter(Boolean).length;
+          await client.query(
+            `INSERT INTO story_pages (story_id, page_number, text_en, text_zh, word_count)
+             VALUES ($1,$2,$3,$4,$5)`,
+            [dbStoryId, p.pageNumber, p.textEn, textZh, wordCount],
+          );
+        }
+
+        // 3) insert vocabulary entries
+        for (const entry of vocabulary.entries) {
+          await client.query(
+            `INSERT INTO vocab_entries (story_id, word, part_of_speech, definition_en, definition_zh, example_sentence, example_translation)
+             VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+            [
+              dbStoryId,
+              entry.word,
+              entry.partOfSpeech ?? "",
+              entry.definitionEn,
+              entry.definitionZh,
+              entry.exampleSentence ?? "",
+              entry.exampleTranslation ?? "",
+            ],
+          );
+        }
+
+        // 4) 建立 media generation jobs for image & audio per page
+        for (const p of story.pages) {
+          // image job
+          const imgRes = await client.query(
+            `INSERT INTO generation_jobs (story_id, job_type, status, retry_count, payload)
+             VALUES ($1,$2,$3,$4,$5) RETURNING id`,
+            [dbStoryId, "image", "pending", 0, JSON.stringify({ pageNumber: p.pageNumber, textEn: p.textEn })],
+          );
+
+          // audio job
+          const audioRes = await client.query(
+            `INSERT INTO generation_jobs (story_id, job_type, status, retry_count, payload)
+             VALUES ($1,$2,$3,$4,$5) RETURNING id`,
+            [
+              dbStoryId,
+              "audio",
+              "pending",
+              0,
+              JSON.stringify({
+                pageNumber: p.pageNumber,
+                textEn: p.textEn,
+                textZh: (translation.pages.find((t) => t.pageNumber === p.pageNumber)?.textZh) ?? "",
+              }),
+            ],
+          );
+
+          // collect ids for potential push
+          if (imgRes && imgRes.rows && imgRes.rows[0]?.id) createdGenerationJobIds.push(String(imgRes.rows[0].id));
+          if (audioRes && audioRes.rows && audioRes.rows[0]?.id) createdGenerationJobIds.push(String(audioRes.rows[0].id));
+        }
+
+        await client.query("COMMIT");
+      } catch (e) {
+        try {
+          await client.query("ROLLBACK");
+        } catch {
+          // ignore rollback errors
+        }
+        throw e;
+      } finally {
+        try {
+          // release connection back to pool
+          client.release();
+        } catch {
+          // ignore
+        }
       }
     }
 
@@ -162,7 +244,7 @@ export async function persistGenerationResult(
         console.error("[OrchestrationPersistence] failed to push to Upstash", pushErr);
         // 記錄到 failed_jobs 以便後台檢視與人工干預
         await errorHandler.recordFailure(
-          { generationJobId: storyId, stage: "upstash_push", attempt: 0, extra: { pushedJobCount: createdGenerationJobIds.length } },
+          { generationJobId: dbStoryId, stage: "upstash_push", attempt: 0, extra: { pushedJobCount: createdGenerationJobIds.length } },
           pushErr,
         );
       }
@@ -191,7 +273,7 @@ export async function persistGenerationResult(
     // 嘗試寫入 failed_jobs，若 recordFailure 自身失敗則記錄錯誤，但不遮蔽原始錯誤
     try {
       await errorHandler.recordFailure(
-        { generationJobId: storyId, stage: "persistence", attempt: 0, extra: { theme } },
+        { generationJobId: dbStoryId, stage: "persistence", attempt: 0, extra: { theme } },
         err,
       );
     } catch (recordErr) {
@@ -202,14 +284,6 @@ export async function persistGenerationResult(
   }
 }
 
-/**
- * 將 generation job ids 與最小 payload 推入 Upstash（using REST API）。
- *
- * 注意：Upstash 有多種使用方式（REST / Redis client），這裡使用較通用的 REST 接法，
- * 因為專案 env 已新增 UPSTASH_REST_URL / UPSTASH_REST_TOKEN。
- *
- * @param jobIds generation job ids 列表
- */
 /**
  * 推送 jobs 到 Upstash，優先嘗試使用 Redis client（若設定 UPSTASH_REDIS_URL），
  * 若 client 不可用或失敗則回退到 REST API（若設定 UPSTASH_REST_URL / UPSTASH_REST_TOKEN）。

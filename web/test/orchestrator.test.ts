@@ -15,13 +15,52 @@ class MockAdapter {
   constructor(responses: unknown[]) {
     this.responses = responses;
   }
- 
+
+  /**
+   * 模擬 adapter 的 createChatCompletion，回傳符合 OpenAIAdapter 的 ChatCompletionResult<T> 形狀：
+   * { data: T, usage?: { promptTokens, completionTokens, totalTokens } }
+   *
+   * 同時支援原始 SDK shape (choices[0].message.content JSON + usage snake_case)
+   * 或直接以 { data, usage } 的格式回傳。
+   */
   async createChatCompletion(_params: unknown) {
-    // 標記參數為已使用以消除 linter 的 unused-vars 警告
     void _params;
     const resp = this.responses[this.idx] ?? this.responses[this.responses.length - 1];
     this.idx += 1;
-    return resp;
+
+    // 支援 SDK 原始 shape：choices[0].message.content (stringified JSON) + usage in snake_case
+    const maybeChoices = (resp as any)?.choices;
+    if (Array.isArray(maybeChoices) && maybeChoices.length > 0) {
+      const choice = maybeChoices[0];
+      const msg = choice?.message;
+      const content = typeof msg?.content === "string" ? msg.content : typeof choice?.text === "string" ? choice.text : undefined;
+      let parsed: unknown = undefined;
+      if (typeof content === "string") {
+        try {
+          parsed = JSON.parse(content);
+        } catch {
+          parsed = content;
+        }
+      }
+      const usageRaw = (resp as any)?.usage;
+      const usage =
+        usageRaw != null
+          ? {
+              promptTokens: (usageRaw.prompt_tokens ?? usageRaw.promptTokens) as number,
+              completionTokens: (usageRaw.completion_tokens ?? usageRaw.completionTokens) as number,
+              totalTokens: (usageRaw.total_tokens ?? usageRaw.totalTokens) as number,
+            }
+          : undefined;
+      return { data: parsed, usage };
+    }
+
+    // 若已經是 adapter 格式 { data, usage }，直接回傳
+    if ((resp as any)?.data !== undefined) {
+      return resp as any;
+    }
+
+    // fallback
+    return { data: resp as unknown, usage: undefined as any };
   }
 }
 
@@ -69,7 +108,16 @@ describe("StoryGenerationOrchestrator (integration minimal)", () => {
     const mock = new MockAdapter([makeResp(storyData), makeResp(translationData), makeResp(vocabData)]);
     
     // 2) 建立 orchestrator 並注入 mock adapter
-    const orchestrator = new StoryGenerationOrchestrator(mock as unknown as OpenAIAdapter);
+    // 在測試環境注入一個 Noop ErrorHandler 避免嘗試寫入資料庫或呼叫外部通知
+    class NoopErrorHandler {
+      async recordFailure() {
+        return null;
+      }
+      shouldRetry() {
+        return false;
+      }
+    }
+    const orchestrator = new StoryGenerationOrchestrator(mock as unknown as OpenAIAdapter, new NoopErrorHandler() as any);
 
     const payload: StoryGenerationPayload = {
       storyId: "test-story-1",
