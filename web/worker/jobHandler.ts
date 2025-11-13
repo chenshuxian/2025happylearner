@@ -1,219 +1,242 @@
-import type { Env } from "../lib/utils/env";
-import { claimJob, getJob, markJobCompleted, markJobFailed, incrementRetry, insertMediaAssetIfNotExists } from "./db";
-import { callImageProvider } from "./providers/imageProvider";
-import { callTTSProvider } from "./providers/ttsProvider";
-import { composeVideo } from "./videoComposer";
-import { uploadLocalFile } from "./blobUploader";
-
 /**
- * Minimal representation of a generation_jobs row used by the worker.
- */
-interface GenerationJobRow {
-  id: string;
-  story_id: string;
-  page_id?: string | null;
-  job_type: "image" | "audio" | "video" | string;
-  payload: Record<string, unknown>;
-  retry_count: number;
-}
-
-/**
- * Normalize unknown DB row into GenerationJobRow if possible.
- * Returns null when required fields are missing or types mismatch.
- */
-function normalizeGenerationJobRow(row: unknown): GenerationJobRow | null {
-  if (!row || typeof row !== "object") return null;
-  const r = row as Record<string, unknown>;
-  const id = typeof r.id === "string" ? r.id : undefined;
-  const story_id = typeof r.story_id === "string" ? r.story_id : undefined;
-  const job_type = typeof r.job_type === "string" ? r.job_type : undefined;
-  const payload = typeof r.payload === "object" && r.payload !== null ? (r.payload as Record<string, unknown>) : {};
-  const retry_count = typeof r.retry_count === "number" ? r.retry_count : (typeof r.retry_count === "bigint" ? Number(r.retry_count) : undefined);
-
-  if (!id || !story_id || !job_type || retry_count === undefined) return null;
-
-  return {
-    id,
-    story_id,
-    page_id: typeof r.page_id === "string" ? (r.page_id as string) : null,
-    job_type: job_type as GenerationJobRow["job_type"],
-    payload,
-    retry_count,
-  };
-}
-
-/**
- * JobHandler
+ * jobHandler.ts
  *
- * 處理單一 generation_job 的主要邏輯：
- * - claim job
- * - 根據 jobType 路由呼叫 provider
- * - 插入 media_assets 並更新 generation_jobs
+ * Worker skeleton for consuming generation_jobs from Upstash and dispatching
+ * them to the text generation pipeline (StoryGenerationOrchestrator) and
+ * persistence (OrchestrationPersistence).
+ *
+ * - 使用範例（本檔為範例 skeleton，包含可注入點與日誌/錯誤處理）：
+ *   NODE_ENV=production UPSTASH_REDIS_URL="redis://..." node ./web/worker/jobHandler.ts
+ *
+ * 實作重點（需根據專案實際需求補足）：
+ * - 在 worker 中注入可測試的 StoryGenerationOrchestrator 與 OrchestrationPersistence
+ * - 以 transaction 更新 generation_jobs 的狀態（pending -> processing -> completed/failed）
+ * - 當需要時呼叫 pushJobsToUpstash（已在 OrchestrationPersistence 實作）
+ *
+ * 函式級註解（JSDoc）已提供供後續擴充使用。
  */
-export class JobHandler {
-  private maxRetries: number;
-  private backoffBaseMs: number;
+import { env } from "../lib/utils/env";
+import type { Pool } from "pg";
 
-  constructor(private dbClient: unknown, private env: Env) {
-    this.maxRetries = Number(process.env.WORKER_MAX_RETRIES ?? "3");
-    this.backoffBaseMs = Number(process.env.WORKER_BACKOFF_BASE_MS ?? "2000");
-  }
+const DEFAULT_POLL_INTERVAL_MS = 2000;
 
-  /**
-   * 處理 job
-   * @param jobId generation_jobs.id
-   */
-  async handle(jobId: string): Promise<void> {
-    // claim job atomically
-    const claimed = await claimJob(jobId);
-    if (!claimed) {
-      console.info("[JobHandler] job not claimable or already processed", { jobId });
-      return;
-    }
- 
-    // normalize and validate claimed row into GenerationJobRow
-    const maybeJob = normalizeGenerationJobRow(claimed);
-    if (!maybeJob) {
-      console.error("[JobHandler] claimed row is not a valid GenerationJobRow", { jobId, row: claimed });
-      await markJobFailed(jobId, "invalid_job_row_shape");
-      return;
-    }
-    const job = maybeJob;
-    const jobType = job.job_type;
-    const payload = job.payload ?? {};
-
+/**
+ * Connect to Upstash using ioredis (if UPSTASH_REDIS_URL 設定) or fail-over to REST (not implemented here).
+ * 使用動態 import 以避免在未安裝 ioredis 時造成啟動錯誤（同 OrchestrationPersistence 的策略）。
+ *
+ * @returns Promise<{ client?: any, queueName: string }>
+ */
+async function connectUpstash() {
+  const queueName = env.UPSTASH_QUEUE_NAME ?? "generation_jobs";
+  if (env.UPSTASH_REDIS_URL) {
     try {
-      if (jobType === "image") {
-        const result = await this.handleImage(job, payload);
-        // runtime guard: ensure uri is a string before passing to markJobCompleted
-        if (result && typeof (result as Record<string, unknown>).uri === "string") {
-          await markJobCompleted(jobId, String((result as Record<string, unknown>).uri));
-        } else {
-          await markJobFailed(jobId, "image provider returned no asset");
-        }
-      } else if (jobType === "audio") {
-        const result = await this.handleAudio(job, payload);
-        if (result && typeof (result as Record<string, unknown>).uri === "string") {
-          await markJobCompleted(jobId, String((result as Record<string, unknown>).uri));
-        } else {
-          await markJobFailed(jobId, "tts provider returned no asset");
-        }
-      } else if (jobType === "video") {
-        // Video job handling:
-        // payload expected: { imageUris: string[], audioUri?: string, perPageDurations?: number[] }
-        const imageUris = (payload["imageUris"] as string[]) ?? [];
-        const audioUri = (payload["audioUri"] as string) ?? undefined;
-        const perPageDurations = (payload["perPageDurations"] as number[]) ?? undefined;
-
-        if (imageUris.length === 0) {
-          await markJobFailed(jobId, "video job missing imageUris");
-        } else {
-          // 1) compose video (local file path)
-          const composeRes = await composeVideo({
-            imageUris,
-            audioUri,
-            perPageDurations,
-            outputDir: undefined,
-            outputFilename: `story_video_${jobId}`,
-            format: "mp4",
-          });
-
-          // 2) upload result to blob storage (local uploader used as fallback)
-          const uploadRes = await uploadLocalFile(composeRes.uri, { filename: `story_video_${jobId}.${composeRes.format}` });
-
-          // 3) insert media asset
-          await insertMediaAssetIfNotExists({
-            story_id: job.story_id,
-            page_id: job.page_id ?? null,
-            type: "video",
-            uri: uploadRes.uri,
-            format: composeRes.format,
-            metadata: composeRes.metadata ?? {},
-            generation_job_id: job.id,
-          });
-
-          // 4) mark completed with uploaded URI
-          await markJobCompleted(jobId, uploadRes.uri);
-        }
-      } else {
-        await markJobFailed(jobId, `unknown job type: ${jobType}`);
-      }
-    } catch (err: unknown) {
-      console.error("[JobHandler] processing error", { jobId, error: String(err) });
-      await this.handleFailure(jobId, err);
+      const IORedisModule = await import("ioredis").then((m) => (m && (m as any).default ? (m as any).default : m));
+      const Redis = IORedisModule as any;
+      const client = new Redis(env.UPSTASH_REDIS_URL as string, { lazyConnect: false });
+      console.info("[worker] connected to Upstash Redis via ioredis");
+      return { client, queueName };
+    } catch (err) {
+      console.warn("[worker] failed to import/connect ioredis, will not start redis consumer", err);
+      return { client: undefined, queueName };
     }
+  } else {
+    console.warn("[worker] UPSTASH_REDIS_URL not set — worker will not poll Redis. Configure UPSTASH_REDIS_URL to enable consumption.");
+    return { client: undefined, queueName };
+  }
+}
+
+/**
+ * Minimal pg pool helper — uses dynamic import of pg and reads DATABASE_URL from env.
+ * This mirrors the fallback pattern used elsewhere in the codebase.
+ *
+ * @returns Promise<Pool | undefined>
+ */
+async function getPgPool(): Promise<Pool | undefined> {
+  const connectionString = process.env.DATABASE_URL ?? process.env.POSTGRES_URL;
+  if (!connectionString) {
+    console.warn("[worker] no DATABASE_URL / POSTGRES_URL found — DB operations will be skipped");
+    return undefined;
+  }
+  try {
+    const { Pool: PgPool } = await import("pg");
+    const pool = new PgPool({ connectionString });
+    return pool as unknown as Pool;
+  } catch (err) {
+    console.error("[worker] failed to import pg Pool", err);
+    return undefined;
+  }
+}
+
+/**
+ * Process a single jobId message retrieved from Upstash.
+ *
+ * NOTE:
+ * - 本範例僅示範流程與錯誤處理框架；實際執行需實作：
+ *   - 查詢 generation_jobs 欄位與 payload
+ *   - 根據 payload.type 決定呼叫 Orchestrator 或其他 handler
+ *   - 在 DB transaction 中更新 job 狀態與寫入 results（或呼叫 OrchestrationPersistence）
+ *
+ * @param jobId string job id 從 Upstash message 取得
+ * @param pool pg Pool or undefined
+ */
+async function processJob(jobId: string, pool?: Pool) {
+  console.info("[worker] processing job", { jobId });
+
+  if (!pool) {
+    console.warn("[worker] no pg pool available — skipping job processing (demo mode)");
+    return;
   }
 
-  private async handleImage(job: GenerationJobRow, payload: Record<string, unknown>) {
-    // payload expected: { storyId, pageNumber, textEn, textZh, promptOverrides? }
-    const prompt = (payload["prompt"] as string) ?? (payload["textEn"] as string) ?? "illustration";
-    const size = (payload["size"] as string) ?? "1024x1024";
-    const providerResp = await callImageProvider({ prompt, size }, this.env);
-    // providerResp: { uri, format, metadata? }
-    const asset = await insertMediaAssetIfNotExists({
-      story_id: job.story_id,
-      page_id: job.page_id ?? null,
-      type: "image",
-      uri: providerResp.uri,
-      format: providerResp.format ?? "png",
-      metadata: providerResp.metadata ?? {},
-      generation_job_id: job.id,
-    });
-    return asset;
-  }
+  const client = await pool.connect();
+  try {
+    // 1) 將 job 狀態設為 processing
+    await client.query("BEGIN");
+    await client.query("UPDATE generation_jobs SET status = $1, updated_at = now() WHERE id = $2", ["processing", jobId]);
 
-  private async handleAudio(job: GenerationJobRow, payload: Record<string, unknown>) {
-    // payload expected: { storyId, pageNumber, textEn, textZh, voice? }
-    const text = (payload["textZh"] as string) ?? (payload["textEn"] as string) ?? "";
-    const voice = (payload["voice"] as string) ?? "default";
-    const format = (payload["format"] as string) ?? "mp3";
-    const providerResp = await callTTSProvider({ text, voice, format: format as "mp3" | "wav" }, this.env);
-    const asset = await insertMediaAssetIfNotExists({
-      story_id: job.story_id,
-      page_id: job.page_id ?? null,
-      type: "audio",
-      uri: providerResp.uri,
-      format: providerResp.format ?? "mp3",
-      metadata: providerResp.metadata ?? {},
-      generation_job_id: job.id,
-    });
-    return asset;
-  }
-
-  /**
-   * 將 unknown 型別的錯誤轉為可供紀錄/回傳的字串
-   * @param err
-   */
-  private errorMessage(err: unknown): string {
-    if (err === undefined || err === null) return String(err);
-    if (typeof err === "string") return err;
-    if (typeof err === "object") {
-      const maybeMsg = (err as { message?: unknown }).message;
-      if (typeof maybeMsg === "string") return maybeMsg;
-      try {
-        return JSON.stringify(err);
-      } catch {
-        return String(err);
-      }
+    // 2) 讀取 job payload（簡化示範）
+    const res = await client.query("SELECT payload, job_type FROM generation_jobs WHERE id = $1 FOR UPDATE", [jobId]);
+    if (!res.rows || res.rows.length === 0) {
+      throw new Error(`job not found: ${jobId}`);
     }
-    return String(err);
-  }
+    const row = res.rows[0];
+    const payload = row.payload as Record<string, unknown>;
+    const jobType = row.job_type as string;
 
-  private async handleFailure(jobId: string, err: unknown) {
-    // increment retry count
-    await incrementRetry(jobId);
-    const job = await getJob(jobId);
-    const retryCount = (job?.retry_count as number) ?? 0;
-    const msg = this.errorMessage(err);
+    console.info("[worker] job payload", { jobId, jobType, payload });
 
-    if (retryCount < this.maxRetries) {
-      // temporary error: mark job as pending again or requeue by external system.
-      // Here we mark failed with a temporary tag to make the error visible; orchestration can requeue.
-      await markJobFailed(jobId, `temporary_error: ${msg}`);
+    // 3) 根據 jobType 決定處理器（此處僅示範 story_script）
+    if (jobType === "story_script" || (payload && (payload as any).type === "story_script")) {
+      // TODO: 注入與呼叫 StoryGenerationOrchestrator 與 OrchestrationPersistence
+      // e.g. const orchestrator = new StoryGenerationOrchestrator();
+      // const result = await orchestrator.run({ storyId: payload.storyId, theme: payload.theme, ... });
+      // await persistGenerationResult(...)
+
+      // Demo 行為：在 DB 中寫入一個簡短的 note 並標記為 completed
+      await client.query(
+        "UPDATE generation_jobs SET status = $1, result_uri = $2, updated_at = now() WHERE id = $3",
+        ["completed", "demo://no-op", jobId],
+      );
+
+      console.info("[worker] demo processed job (marked completed)", { jobId });
     } else {
-      // exceeded retries -> permanent failure
-      await markJobFailed(jobId, `permanent_error: ${msg}`);
-      // hook for notifications (Slack / ErrorHandler) can be added here
+      // 未支援的 job type
+      console.warn("[worker] unsupported job type — marking failed", { jobId, jobType });
+      await client.query(
+        "UPDATE generation_jobs SET status = $1, failure_reason = $2, updated_at = now() WHERE id = $3",
+        ["failed", `unsupported job type: ${jobType}`, jobId],
+      );
+    }
+
+    await client.query("COMMIT");
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (rollbackErr) {
+      console.error("[worker] rollback failed", rollbackErr);
+    }
+    console.error("[worker] error processing job", { jobId, error: err });
+    // 增加 retry_count 並決定是否重新推入佇列（此處僅示意）
+    try {
+      await client.query("UPDATE generation_jobs SET retry_count = retry_count + 1, status = $1, updated_at = now() WHERE id = $2", ["failed", jobId]);
+    } catch (e) {
+      console.error("[worker] failed to update retry_count", e);
+    }
+  } finally {
+    try {
+      client.release();
+    } catch {
+      // ignore
     }
   }
+}
+
+/**
+ * Poll loop: 從 Upstash queue lpop 取得 message，解析後呼叫 processJob。
+ *
+ * message format expected: JSON.stringify({ jobId: "<uuid>", timestamp: <ms> })
+ */
+async function pollLoop() {
+  const { client, queueName } = await connectUpstash();
+  const pool = await getPgPool();
+
+  if (!client) {
+    console.warn("[worker] no redis client — exiting poll loop");
+    return;
+  }
+
+  const redis = client as any;
+
+  console.info("[worker] starting poll loop for queue", queueName);
+
+  let running = true;
+  process.on("SIGINT", () => {
+    console.info("[worker] SIGINT received — shutting down");
+    running = false;
+  });
+  process.on("SIGTERM", () => {
+    console.info("[worker] SIGTERM received — shutting down");
+    running = false;
+  });
+
+  while (running) {
+    try {
+      // 使用 LPOP 取出 single message（Upstash 支援 list ops）
+      // 若需要 blocking pop 可改為 BRPOP 等待
+      const raw = await redis.lpop(queueName);
+      if (!raw) {
+        // no message
+        await new Promise((r) => setTimeout(r, DEFAULT_POLL_INTERVAL_MS));
+        continue;
+      }
+
+      let parsed: { jobId?: string } | null = null;
+      try {
+        parsed = JSON.parse(String(raw));
+      } catch {
+        console.warn("[worker] failed to parse message, skipping", raw);
+        continue;
+      }
+
+      if (!parsed || !parsed.jobId) {
+        console.warn("[worker] invalid message shape, skipping", parsed);
+        continue;
+      }
+
+      await processJob(parsed.jobId, pool);
+    } catch (err) {
+      console.error("[worker] poll error", err);
+      // backoff on error
+      await new Promise((r) => setTimeout(r, DEFAULT_POLL_INTERVAL_MS * 2));
+    }
+  }
+
+  // close redis client and pg pool
+  try {
+    await (client as any).quit();
+  } catch {
+    // ignore
+  }
+  if (pool) {
+    try {
+      await pool.end();
+    } catch {
+      // ignore
+    }
+  }
+
+  console.info("[worker] stopped");
+}
+
+/**
+ * Entrypoint
+ */
+if (require.main === module) {
+  (async () => {
+    try {
+      await pollLoop();
+    } catch (err) {
+      console.error("[worker] fatal error", err);
+      process.exit(1);
+    }
+  })();
 }

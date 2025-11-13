@@ -1,77 +1,78 @@
 import { NextResponse } from "next/server";
-import { StoryGenerationOrchestrator } from "../../../../lib/openai/StoryGenerationOrchestrator";
-import { persistGenerationResult } from "../../../../lib/openai/OrchestrationPersistence";
-
+import { db } from "../../../../db/client";
+import { generationJobs } from "../../../../db/schema";
+ 
 /**
  * POST /api/generation/story-script
  *
- * 由管理者或 Cron 觸發的同步測試端點（注意：實際上線應改為非同步佇列）
+ * 非同步優先版路由（建立 generation_jobs 並立即回傳 jobIds）
+ *
  * Body JSON 範例：
  * {
  *   "storyId": "optional-existing-id",
  *   "theme": "A friendly dragon",
  *   "tone": "warm",
- *   "ageRange": "0-6"
+ *   "ageRange": "0-6",
+ *   "scheduledAt": "2025-11-13T09:00:00.000Z",
+ *   "initiatedBy": "cron" // or "admin"
  * }
  *
- * 路由流程（測試/管理介面模式）：
- * 1) 呼叫 StoryGenerationOrchestrator 生成文字階段（同步）
- * 2) 將生成結果落地：寫入 stories / story_pages / vocab_entries 並建立 media generation jobs
- * 3) 若已設定 Upstash，將媒體 job id 推入 Queue 供 Worker 非同步處理
+ * 行為：
+ * - 建立一個或多個 generation_jobs（此 endpoint 以建立 story_script job 為主）
+ * - 回傳 { ok: true, storyId, jobIds: ["..."] }
  *
- * 生產環境建議：直接建立 generation_jobs 並回傳 job id，將實際生成推入 worker 非同步處理以避免超時與高額成本。
+ * 註：實際的消費者會由 worker（web/worker/）非同步取出 job 並執行故事生成流程。
  */
-
-/** POST handler */
+ 
 export async function POST(request: Request) {
   try {
     const body = await request.json().catch(() => ({}));
-
+ 
     if (!body.theme) {
       return NextResponse.json({ ok: false, error: "missing theme" }, { status: 400 });
     }
-
-    const payload = {
-      storyId: body.storyId ?? crypto.randomUUID(),
-      theme: String(body.theme),
-      tone: body.tone ?? "warm",
-      ageRange: body.ageRange ?? "0-6",
-      regenerate: body.regenerate === true,
+ 
+    // 建立或使用傳入的 storyId
+    const storyId = typeof body.storyId === "string" && body.storyId.length > 0 ? body.storyId : crypto.randomUUID();
+    const theme = String(body.theme);
+    const tone = body.tone ?? "warm";
+    const ageRange = body.ageRange ?? "0-6";
+    const scheduledAt = body.scheduledAt ?? new Date().toISOString();
+    const initiatedBy = body.initiatedBy ?? "manual";
+ 
+    // Job payload contract (請參考 spec.md)
+    const jobPayload = {
+      type: "story_script",
+      storyId,
+      theme,
+      tone,
+      ageRange,
+      scheduledAt,
+      initiatedBy,
     };
-
-    const orchestrator = new StoryGenerationOrchestrator();
-
-    // 同步執行文字生成（注意：在生產環境請避免長時間同步呼叫）
-    const result = await orchestrator.run(payload);
-
-    // 將結果落地並建立媒體 generation jobs（transaction 保證一致性）
-    const createdJobIds = await persistGenerationResult(
-      payload.storyId,
-      payload.theme,
-      result.story,
-      result.translation,
-      result.vocabulary,
-    );
-
-    return NextResponse.json(
-      {
-        ok: true,
-        storyId: payload.storyId,
-        result,
-        createdJobIds,
-      },
-      { status: 200 },
-    );
+ 
+    // 使用 drizzle db insert 建立 generation job（status = pending）
+    // 在測試環境可能會被 mock，因此以 db.insert(...).values(...).returning() 寫法為主
+    const insertRes = await db.insert(generationJobs).values({
+      storyId: storyId,
+      jobType: "story_script",
+      status: "pending",
+      retryCount: 0,
+      // Drizzle 的 jsonb 欄位接受物件，直接傳 jobPayload (非字串化)
+      payload: jobPayload,
+    }).returning();
+ 
+    // insertRes 型態視 db client 而定，統一轉為 string id 陣列
+    const createdJobIds = Array.isArray(insertRes)
+      ? insertRes.map((r) => String((r as { id: unknown }).id))
+      : [];
+ 
+    console.info("[route] created generation_jobs", { storyId, createdJobIds, initiatedBy });
+ 
+    return NextResponse.json({ ok: true, storyId, jobIds: createdJobIds }, { status: 200 });
   } catch (err: unknown) {
-    // 使用 unknown 並安全取得錯誤訊息，避免使用 any
     const message = err instanceof Error ? err.message : String(err);
-    console.error("[route] generation/story-script failed", { error: err });
-    return NextResponse.json(
-      {
-        ok: false,
-        error: message || "unknown error",
-      },
-      { status: 500 },
-    );
+    console.error("[route] generation/story-script (async) failed", { error: err });
+    return NextResponse.json({ ok: false, error: message || "unknown error" }, { status: 500 });
   }
 }
