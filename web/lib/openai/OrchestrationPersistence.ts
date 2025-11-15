@@ -227,7 +227,7 @@ export async function persistGenerationResult(
         throw e;
       } finally {
         try {
-          // release connection back to pool
+          // release connection back到 pool
           client.release();
         } catch {
           // ignore
@@ -298,55 +298,127 @@ async function pushJobsToUpstash(jobIds: string[]) {
   // 將 jobIds 轉為簡單訊息字串（Redis list 儲存 string）
   const messages = jobIds.map((id) => JSON.stringify({ jobId: id, timestamp: Date.now() }));
 
-  // 1) 優先使用 Redis client（UPSTASH_REDIS_URL），動態 import 以避免必須安裝套件時出錯
+  // 優先使用 Redis client（UPSTASH_REDIS_URL）
   if (env.UPSTASH_REDIS_URL) {
     try {
       const IORedisModule = await import("ioredis").then((m) => (m && (m as any).default ? (m as any).default : m));
       const Redis = IORedisModule;
-      const client = new Redis(env.UPSTASH_REDIS_URL as string, { lazyConnect: false });
+
+      /**
+       * 使用 ioredis client 推送 messages 到 list queue，採用 lazyConnect 並在必要時呼叫 connect()。
+       *
+       * 行為：
+       *  - 建立 client 時使用 { lazyConnect: true }，避免 constructor 與 connect() 同時連線造成 "already connecting/connected" 錯誤。
+       *  - 若 client 有 connect() 方法則 await client.connect()，若錯誤訊息包含 "already connecting" 或 "already connected" 則視為可忽略警告。
+       *  - 執行 rpush 並在最後嘗試 quit()。
+       */
+      const client = new Redis(env.UPSTASH_REDIS_URL as string, { lazyConnect: true });
 
       try {
-        // use RPUSH to append messages to the list queue
+        if (typeof client.connect === "function") {
+          try {
+            await client.connect();
+            console.info("[OrchestrationPersistence] ioredis connect successful");
+          } catch (connectErr: any) {
+            const msg = String(connectErr && (connectErr.message || connectErr));
+            if (msg.includes("already connecting") || msg.includes("already connected")) {
+              console.warn("[OrchestrationPersistence] ioredis connect warning (already connected/connecting)", msg);
+            } else {
+              throw connectErr;
+            }
+          }
+        } else {
+          console.info("[OrchestrationPersistence] ioredis client has no connect(), assuming constructor handled connection");
+        }
+
         for (const msg of messages) {
           await client.rpush(queue, msg);
         }
+
+        console.info("[OrchestrationPersistence] pushed jobs to Upstash via Redis client", { count: jobIds.length });
+        return;
       } finally {
         try {
-          await client.quit();
-        } catch {
-          // ignore
+          if (typeof client.quit === "function") await client.quit();
+        } catch (qErr) {
+          console.warn("[OrchestrationPersistence] client.quit() failed", qErr);
         }
       }
-
-      console.info("[OrchestrationPersistence] pushed jobs to Upstash via Redis client", { count: jobIds.length });
-      return;
     } catch (err) {
-      // 若 Redis push 失敗，記錄 warning 並繼續嘗試 REST 回退
       console.warn("[OrchestrationPersistence] Redis client push failed, falling back to REST", err);
     }
   }
 
-  // 2) 回退到 REST API
+  // 回退到 REST API（支援 queue/messages 與 command-style）
   if (env.UPSTASH_REST_URL && env.UPSTASH_REST_TOKEN) {
-    const resp = await fetch(env.UPSTASH_REST_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${env.UPSTASH_REST_TOKEN}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ queue, messages }),
-    });
+    const headers = {
+      Authorization: `Bearer ${env.UPSTASH_REST_TOKEN}`,
+      "Content-Type": "application/json",
+    };
 
-    if (!resp.ok) {
-      const txt = await resp.text().catch(() => "<no body>");
-      throw new Error(`Upstash REST push failed ${resp.status} ${txt}`);
+    /**
+     * Helper: POST JSON and return { ok, status, bodyText } with safe catch.
+     * @param bodyObj
+     */
+    async function postJson(bodyObj: unknown) {
+      try {
+        const resp = await fetch(env.UPSTASH_REST_URL as string, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(bodyObj),
+        });
+        const bodyText = await resp.text().catch(() => "<no body>");
+        return { ok: resp.ok, status: resp.status, bodyText };
+      } catch (e) {
+        return { ok: false, status: 0, bodyText: String(e) };
+      }
     }
 
-    console.info("[OrchestrationPersistence] pushed jobs to Upstash via REST", { count: jobIds.length });
-    return;
+    // 1) Queues-style attempt
+    const resp1 = await postJson({ queue, messages });
+    console.info("[OrchestrationPersistence] REST attempt (queues-style) ->", { status: resp1.status, body: resp1.bodyText });
+
+    if (resp1.ok) {
+      console.info("[OrchestrationPersistence] pushed jobs to Upstash via REST (queue/messages)", { count: jobIds.length });
+      return;
+    }
+
+    // If auth error, abort
+    if (resp1.status === 401 || resp1.status === 403) {
+      const errMsg = `[OrchestrationPersistence] REST (queue/messages) returned auth error ${resp1.status}: ${resp1.bodyText}`;
+      console.error(errMsg);
+      throw new Error(errMsg);
+    }
+
+    const bodyLower = (resp1.bodyText || "").toLowerCase();
+    const looksLikeParseError =
+      bodyLower.includes("failed to parse") || bodyLower.includes("parse error") || bodyLower.includes("err failed to parse command");
+
+    if (!resp1.ok && (looksLikeParseError || resp1.status === 400 || resp1.status === 422 || resp1.status === 0)) {
+      console.warn("[OrchestrationPersistence] queues-style REST returned parse-like/invalid response, attempting Redis command-style fallback", {
+        status: resp1.status,
+        body: resp1.bodyText,
+      });
+
+      const commandBody = { command: ["RPUSH", queue, ...messages] };
+      const resp2 = await postJson(commandBody);
+      console.info("[OrchestrationPersistence] REST attempt (command-style) ->", { status: resp2.status, body: resp2.bodyText });
+
+      if (resp2.ok) {
+        console.info("[OrchestrationPersistence] pushed jobs to Upstash via REST (redis command)", { count: jobIds.length });
+        return;
+      }
+
+      const errMsg2 = `Upstash REST command push failed ${resp2.status}: ${resp2.bodyText}`;
+      console.error("[OrchestrationPersistence] " + errMsg2);
+      throw new Error(errMsg2);
+    }
+
+    const errMsg = `[OrchestrationPersistence] REST (queue/messages) failed and command fallback not attempted: ${resp1.status} ${resp1.bodyText}`;
+    console.error(errMsg);
+    throw new Error(errMsg);
   }
 
-  // 若沒有任何可用的 Upstash 設定，丟出錯誤
   throw new Error("No Upstash configuration found (UPSTASH_REDIS_URL or UPSTASH_REST_URL required)");
 }
 
